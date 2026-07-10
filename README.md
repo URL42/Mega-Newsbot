@@ -14,17 +14,17 @@ central QA sheet for drift/consistency monitoring.
 ## Architecture
 
 ```
-                    ┌──────────────────────────────────┐
+                    ┌───────────────────────────────────┐
                     │   sentiment_lookup (sub-workflow) │
                     │   Input normalize → Alpha Vantage │
                     │   → (throttled?) Marketaux        │
                     │   → Qwen dimensional scoring      │
                     │   → merge + net read → QA → log   │
-                    └───────────────┬──────────────────┘
+                    └───────────────┬───────────────────┘
                         called by   │   called by
           ┌─────────────────────────┴─────────────────────────┐
-          │                                                    │
-┌─────────▼──────────┐                          ┌──────────────▼─────────────┐
+          │                                                   │
+┌─────────▼──────────┐                          ┌──────────────▼──────────────┐
 │ News Bot A          │                          │ News Bot B                 │
 │ Proactive Daily Push│                          │ Reactive On-Demand         │
 │ cron 07:00          │                          │ Telegram Trigger           │
