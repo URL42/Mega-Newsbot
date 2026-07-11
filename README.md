@@ -8,8 +8,9 @@ self-hosted n8n. Two behaviors from one shared sentiment engine:
 - **Reactive** — a group-chat agent for on-demand questions ("latest on X",
   "sentiment on NVDA"), with conversation memory and live web search.
 
-All LLM outputs are validated by deterministic QA checks and logged to a
-central QA sheet for drift/consistency monitoring.
+All LLM outputs are validated by deterministic QA checks, logged to a central
+QA sheet, and reviewed weekly by an AI analyst that diagnoses failures against
+a knowledge base of known signatures.
 
 ## Architecture
 
@@ -32,12 +33,19 @@ central QA sheet for drift/consistency monitoring.
 │ → sentiment_lookup  │                          │ → Auth gate (chat IDs)     │
 │ → Qwen compose      │                          │ → AI Agent (Claude)        │
 │ → QA → log          │                          │    tools: tavily_search,   │
-│ → Telegram push     │                          │           sentiment_lookup │
-│   (to group)        │                          │ → Telegram reply           │
+│ → sanitize → send   │                          │           sentiment_lookup │
+│   (to group)        │                          │ → sanitize → reply         │
 └─────────┬───────────┘                          └──────────────┬─────────────┘
           │                                                     │
           └────────────────► llm_qa_logger ◄────────────────────┘
                      (shared: normalize → Google Sheet append)
+                                    │
+                          ┌─────────▼──────────┐
+                          │ QA Analyst (weekly) │
+                          │ read sheet → stats  │
+                          │ → Claude diagnosis  │
+                          │ → Telegram DM report│
+                          └────────────────────┘
 ```
 
 ## Components
@@ -48,6 +56,7 @@ central QA sheet for drift/consistency monitoring.
 | `News Bot A - Proactive Daily Push` | Cron `0 7 * * *` | Tavily news per focus topic + sentiment block → HTML digest → Telegram group |
 | `News Bot B - Reactive On-Demand` | Telegram webhook | Agent (Claude Sonnet) with search + sentiment tools, windowed memory, non-text event filter, chat allow-list |
 | `llm_qa_logger (shared sub-workflow)` | Called by A & sub-workflow | Appends standardized QA records to a Google Sheet |
+| `QA Analyst - Weekly Pipeline Health` | Cron `0 8 * * 1` | Reads QA sheet → deterministic stats → Claude diagnosis against failure-signature KB → plain-text DM report |
 
 ## Models & data sources
 
@@ -56,6 +65,7 @@ central QA sheet for drift/consistency monitoring.
 | Dimensional scoring | `qwen3.5:9b` via Ollama (`/api/chat`, `format: json`, `think: false`) | Local, free, high-volume |
 | Digest compose | `qwen3.5:9b` via Ollama | Prose HTML, `think: false` |
 | Reactive agent | `claude-sonnet-5` (Anthropic) | Tool routing + synthesis |
+| QA analyst | `claude-sonnet-5` (Anthropic) | Interprets pre-computed stats only |
 | News discovery | Tavily (`topic=news/finance`, `time_range`) | Free tier 1,000 credits/mo |
 | Ticker sentiment | Alpha Vantage `NEWS_SENTIMENT` | Free tier 25 req/day — one batched call per run |
 | Sentiment fallback | Marketaux | Kicks in on AV throttle (detected via `Note`/`Information`) |
@@ -80,26 +90,41 @@ the digest flags thin reads (`n` of 1–2) rather than hiding them.
 
 ## QA & monitoring
 
-Deterministic validators (Code nodes) run inline, never block, and attach a
-`qa` record to the data:
+Three layers:
+
+**1. Inline validators** (Code nodes) run deterministically, never block, and
+attach a `qa` record to the data:
 
 - **Validator A** (`sentiment_lookup`): JSON parse/coverage, range checks,
   `polarity×materiality×confidence == score` recompute, label-band check,
   silent-failure (all-nulls) detector, per-ticker divergence.
 - **Validator B** (`News Bot A`): length bounds, banned strings (preamble,
   advice, markdown leakage), **hallucinated-link detector** (every href must
-  exist in the payload), unknown-ticker detector, HTML balance (Telegram 400
-  preventer).
+  exist in the payload), unknown-ticker detector, HTML balance.
 
-Both feed `llm_qa_logger` (fire-and-forget, Wait for Sub-Workflow OFF), which
-appends to a Google Sheet with columns:
+The `Telegram chunk` nodes in both bots additionally **sanitize outbound
+HTML** (escape stray angle brackets, balance tags per chunk) so malformed
+markup degrades to visible text instead of a Telegram 400.
+
+**2. Central log.** Validators feed `llm_qa_logger` (fire-and-forget, Wait
+for Sub-Workflow OFF; Sheets node mapping mode must be **Map Automatically**),
+which appends to a Google Sheet:
 
 ```
 ts | project | workflow | node | model | status | flags | metrics
 ```
 
-`status` ∈ pass / warn / fail. Review weekly for drift; `divergence` and
-`math_bad` trends are the early-warning metrics.
+**3. Weekly AI analyst.** `QA Analyst` reads the sheet, computes stats
+deterministically in a Code node (fail rates, flag frequencies, early-vs-late
+trend, mean divergence per ticker), and has Claude diagnose against the
+failure-signature knowledge base — with instructions to hedge on thin samples
+and never invent numbers. Report arrives as a plain-text Telegram DM (no
+parse mode, so the diagnostician can't fail on formatting itself).
+
+**Known blind spot:** the analyst sees only rows that reached the Sheet. A
+failure that prevents the log write (e.g. a broken Sheets node) is invisible
+to it — the global n8n error workflow is the net for that layer. Planned fix:
+give the analyst the n8n API as a tool to cross-reference failed executions.
 
 ## Setup
 
@@ -112,11 +137,11 @@ ts | project | workflow | node | model | status | flags | metrics
   group setup below).
 
 ### Credentials (n8n → Credentials)
-- Telegram API (trigger + both send nodes)
-- Anthropic API (agent chat model)
+- Telegram API (trigger + send nodes across bots and analyst)
+- Anthropic API (agent + analyst chat models)
 - Tavily (predefined credential type)
 - Alpha Vantage + Marketaux (Query Auth credentials — **never inline keys**)
-- Google Sheets OAuth (QA logger)
+- Google Sheets OAuth (QA logger + analyst)
 
 ### Telegram group setup
 1. Create the group, add the bot.
@@ -140,12 +165,14 @@ ts | project | workflow | node | model | status | flags | metrics
 ### Import order
 1. `workflows/sentiment_lookup.json` — save, note its workflow ID
 2. `workflows/llm_qa_logger.json` — save, note its ID; create the QA Sheet
-   with the header row above
+   with the header row above; set the Sheets node to Map Automatically
 3. `workflows/news_bot_a_proactive.json` — point its `sentiment_lookup` and
    logger Execute Workflow nodes at the IDs from steps 1–2
 4. `workflows/news_bot_b_reactive.json` — same re-pointing for the
    `sentiment_lookup` tool; set the Auth gate chat IDs; activate to register
    the webhook
+5. `workflows/qa_analyst.json` — point Read QA log at the same Sheet;
+   runs weekly, or execute manually anytime for an on-demand health report
 
 ### Configuration
 All reader-facing config lives in **News Bot A → CONFIG** node:
@@ -169,8 +196,9 @@ Bot B live. Known failure signatures:
 - **All `model_score` null** → scoring call broken (model tag, Ollama
   unreachable, or reasoning leaked into JSON). The merge fails silently by
   design; Validator A flags it.
-- **Telegram 400 "can't parse entities"** → broken HTML from the model;
-  Validator B's balance check is the early warning.
+- **Telegram 400 "can't parse entities"** → broken HTML from the model; the
+  chunk-node sanitizer now absorbs this (degrades to visible text); Validator
+  B logs the underlying flag either way.
 - **Tool schema rejection from Anthropic** (`input_schema.properties` pattern)
   → a tool is exposing a malformed schema; the `sentiment_lookup` tool uses an
   explicit manual schema (`tickers`: string) for this reason.
@@ -183,6 +211,9 @@ Bot B live. Known failure signatures:
 - **Executions stop at `Has text` or `Auth gate`** → non-text event filtered
   (by design), or the incoming `chat.id` doesn't match the allow-list — read
   the actual ID from the execution input.
+- **QA rows missing despite incidents** → logger itself failed (check
+  `llm_qa_logger` executions; historically: Sheets mapping mode left on
+  Define Below).
 
 ## Security
 
@@ -196,6 +227,8 @@ Bot B live. Known failure signatures:
 
 ## Roadmap
 
+- n8n API as a QA Analyst tool — cross-reference failed executions against
+  the Sheet (closes the logger blind spot).
 - 👍/👎 inline-keyboard feedback on digests/answers → logged next to QA rows →
   few-shot calibration of the scoring prompt.
 - Relevance/recency-weighted net aggregation (fields already flow; merge-node
