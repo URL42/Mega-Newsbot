@@ -1,11 +1,11 @@
-# Mega Newsbot — Telegram News & Market Sentiment Bot
+# Newsbot — Telegram News & Market Sentiment Bot
 
-A personal news and market-sentiment bot for one reader, built on self-hosted
-n8n. Two behaviors from one shared sentiment engine:
+A news and market-sentiment bot for a private Telegram group, built on
+self-hosted n8n. Two behaviors from one shared sentiment engine:
 
-- **Proactive** — a scheduled morning digest covering configured focus topics
-  plus a sentiment read on tracked tickers.
-- **Reactive** — a Telegram DM agent for on-demand questions ("latest on X",
+- **Proactive** — a scheduled morning digest posted to the group, covering
+  configured focus topics plus a sentiment read on tracked tickers.
+- **Reactive** — a group-chat agent for on-demand questions ("latest on X",
   "sentiment on NVDA"), with conversation memory and live web search.
 
 All LLM outputs are validated by deterministic QA checks and logged to a
@@ -14,25 +14,26 @@ central QA sheet for drift/consistency monitoring.
 ## Architecture
 
 ```
-                    ┌───────────────────────────────────┐
+                    ┌──────────────────────────────────┐
                     │   sentiment_lookup (sub-workflow) │
                     │   Input normalize → Alpha Vantage │
                     │   → (throttled?) Marketaux        │
                     │   → Qwen dimensional scoring      │
                     │   → merge + net read → QA → log   │
-                    └───────────────┬───────────────────┘
+                    └───────────────┬──────────────────┘
                         called by   │   called by
           ┌─────────────────────────┴─────────────────────────┐
-          │                                                   │
-┌─────────▼──────────┐                          ┌──────────────▼──────────────┐
+          │                                                    │
+┌─────────▼──────────┐                          ┌──────────────▼─────────────┐
 │ News Bot A          │                          │ News Bot B                 │
 │ Proactive Daily Push│                          │ Reactive On-Demand         │
 │ cron 07:00          │                          │ Telegram Trigger           │
-│ Tavily (per topic)  │                          │ → Auth gate (chat ID)      │
-│ → sentiment_lookup  │                          │ → AI Agent (Claude)        │
-│ → Qwen compose      │                          │    tools: tavily_search,   │
-│ → QA → log          │                          │           sentiment_lookup │
-│ → Telegram push     │                          │ → Telegram reply           │
+│ Tavily (per topic)  │                          │ → Has text (event filter)  │
+│ → sentiment_lookup  │                          │ → Auth gate (chat IDs)     │
+│ → Qwen compose      │                          │ → AI Agent (Claude)        │
+│ → QA → log          │                          │    tools: tavily_search,   │
+│ → Telegram push     │                          │           sentiment_lookup │
+│   (to group)        │                          │ → Telegram reply           │
 └─────────┬───────────┘                          └──────────────┬─────────────┘
           │                                                     │
           └────────────────► llm_qa_logger ◄────────────────────┘
@@ -44,8 +45,8 @@ central QA sheet for drift/consistency monitoring.
 | Workflow | Trigger | Purpose |
 |---|---|---|
 | `sentiment_lookup (sub-workflow)` | Called by A & B | Ticker news → dimensional sentiment scoring → per-ticker net read |
-| `News Bot A - Proactive Daily Push` | Cron `0 7 * * *` | Tavily news per focus topic + sentiment block → HTML digest → Telegram |
-| `News Bot B - Reactive On-Demand` | Telegram webhook | Agent (Claude Sonnet) with search + sentiment tools, windowed memory, chat-ID auth gate |
+| `News Bot A - Proactive Daily Push` | Cron `0 7 * * *` | Tavily news per focus topic + sentiment block → HTML digest → Telegram group |
+| `News Bot B - Reactive On-Demand` | Telegram webhook | Agent (Claude Sonnet) with search + sentiment tools, windowed memory, non-text event filter, chat allow-list |
 | `llm_qa_logger (shared sub-workflow)` | Called by A & sub-workflow | Appends standardized QA records to a Google Sheet |
 
 ## Models & data sources
@@ -73,6 +74,9 @@ or materiality) rather than by rule. Per-ticker `net` pools provider scores
 and model scores; labels at ±0.15. The QA validator independently recomputes
 the arithmetic, checks ranges and label bands, and measures model-vs-provider
 divergence per ticker (divergence is surfaced, not smoothed — it's signal).
+
+Note: sentiment coverage for ETFs and thinly-covered symbols is often sparse;
+the digest flags thin reads (`n` of 1–2) rather than hiding them.
 
 ## QA & monitoring
 
@@ -104,7 +108,8 @@ ts | project | workflow | node | model | status | flags | metrics
   webhooks (e.g. Tailscale Funnel), `WEBHOOK_URL` set.
 - Ollama on the LAN with the scoring model pulled; must bind `0.0.0.0` if n8n
   runs in Docker (`OLLAMA_HOST=0.0.0.0`). Endpoint used: `http://<host>:11434/api/chat`.
-- A Telegram bot (via @BotFather) and the reader's numeric chat ID.
+- A Telegram bot (via @BotFather) added to the target group (see Telegram
+  group setup below).
 
 ### Credentials (n8n → Credentials)
 - Telegram API (trigger + both send nodes)
@@ -113,6 +118,25 @@ ts | project | workflow | node | model | status | flags | metrics
 - Alpha Vantage + Marketaux (Query Auth credentials — **never inline keys**)
 - Google Sheets OAuth (QA logger)
 
+### Telegram group setup
+1. Create the group, add the bot.
+2. **Group Privacy:** @BotFather → `/mybots` → Bot Settings → Group Privacy →
+   **Disable** so the bot receives plain group messages (with privacy ON,
+   bots only reliably receive /commands, @mentions, and replies). After
+   changing this, the bot **must be removed from the group and re-added**
+   for the setting to take effect.
+3. **Get the group chat ID** (a negative number): post in the group, then
+   read `message.chat.id` from the Telegram Trigger input in n8n's
+   Executions list. `getUpdates` returns 409 while a webhook is registered,
+   so use the execution log instead.
+4. Put the group ID in **News Bot A → CONFIG → `chat_id`** and in
+   **News Bot B → Auth gate** (OR'd with any personal chat IDs that should
+   also be allowed, e.g. for DM access).
+5. **Supergroup caveat:** Telegram silently upgrades groups to supergroups
+   when certain settings change or members are added — the chat ID changes
+   to a new `-100…` value and the old one goes dead. If the bot goes silent
+   in the group, re-grab the ID from a fresh execution and update both spots.
+
 ### Import order
 1. `workflows/sentiment_lookup.json` — save, note its workflow ID
 2. `workflows/llm_qa_logger.json` — save, note its ID; create the QA Sheet
@@ -120,15 +144,21 @@ ts | project | workflow | node | model | status | flags | metrics
 3. `workflows/news_bot_a_proactive.json` — point its `sentiment_lookup` and
    logger Execute Workflow nodes at the IDs from steps 1–2
 4. `workflows/news_bot_b_reactive.json` — same re-pointing for the
-   `sentiment_lookup` tool; set the Auth gate chat ID; activate to register
+   `sentiment_lookup` tool; set the Auth gate chat IDs; activate to register
    the webhook
 
 ### Configuration
 All reader-facing config lives in **News Bot A → CONFIG** node:
-`focus_topics` (drives Tavily searches), `tracked_tickers`, `chat_id`.
-The agent's focus areas are also stated in **News Bot B → AI Agent** system
-message — keep the two aligned. Model tags are set inside the two Ollama HTTP
-nodes and the QA validators' `model` field.
+`focus_topics` (drives Tavily searches), `tracked_tickers`, `chat_id`
+(the group). The agent's focus areas are also stated in **News Bot B →
+AI Agent** system message — keep the two aligned. Model tags are set inside
+the two Ollama HTTP nodes and the QA validators' `model` field.
+
+**Access control (Bot B):** the `Has text` IF node drops non-text group
+events (joins, photos, pins) before they reach the agent; the `Auth gate`
+allow-lists chat IDs. Gating is per-chat, not per-person — anyone in an
+allowed group can use the bot and spend API credits. For person-level
+control, gate on `message.from.id` instead.
 
 ## Testing
 
@@ -147,6 +177,12 @@ Bot B live. Known failure signatures:
 - **"No ticker received"** → the agent called sentiment without a symbol; the
   error text instructs it to resolve the ticker via search or fall back to
   news-only (private companies).
+- **Bot silent in the group, no executions** → Group Privacy still ON, or the
+  bot wasn't removed/re-added after changing it, or the group upgraded to a
+  supergroup and the chat ID changed (see Telegram group setup).
+- **Executions stop at `Has text` or `Auth gate`** → non-text event filtered
+  (by design), or the incoming `chat.id` doesn't match the allow-list — read
+  the actual ID from the execution input.
 
 ## Security
 
@@ -154,8 +190,8 @@ Bot B live. Known failure signatures:
   credential IDs, never raw keys — check before committing:
   `grep -rE "tvly-|apikey|api_token" workflows/` should return nothing
   suspicious.
-- Bot B is gated to allow-listed Telegram chat IDs (the Auth gate node) so
-  strangers can't spend API credits.
+- Bot B is gated to allow-listed Telegram chats (Auth gate node) so strangers
+  can't spend API credits; every member of an allowed group has access.
 - If a key ever lands in a chat, log, or commit: rotate it.
 
 ## Roadmap
