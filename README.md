@@ -15,17 +15,17 @@ a knowledge base of known signatures.
 ## Architecture
 
 ```
-                    ┌──────────────────────────────────┐
+                    ┌───────────────────────────────────┐
                     │   sentiment_lookup (sub-workflow) │
                     │   Input normalize → Alpha Vantage │
                     │   → (throttled?) Marketaux        │
                     │   → Qwen dimensional scoring      │
                     │   → merge + net read → QA → log   │
-                    └───────────────┬──────────────────┘
+                    └───────────────┬───────────────────┘
                         called by   │   called by
-          ┌─────────────────────────┴─────────────────────────┐
+          ┌─────────────────────────┴──────────────────────────┐
           │                                                    │
-┌─────────▼──────────┐                          ┌──────────────▼─────────────┐
+┌─────────▼───────────┐                          ┌─────────────▼──────────────┐
 │ News Bot A          │                          │ News Bot B                 │
 │ Proactive Daily Push│                          │ Reactive On-Demand         │
 │ cron 07:00          │                          │ Telegram Trigger           │
@@ -40,12 +40,12 @@ a knowledge base of known signatures.
           └────────────────► llm_qa_logger ◄────────────────────┘
                      (shared: normalize → Google Sheet append)
                                     │
-                          ┌─────────▼──────────┐
+                          ┌─────────▼───────────┐
                           │ QA Analyst (weekly) │
                           │ read sheet → stats  │
                           │ → Claude diagnosis  │
                           │ → Telegram DM report│
-                          └────────────────────┘
+                          └─────────────────────┘
 ```
 
 ## Components
